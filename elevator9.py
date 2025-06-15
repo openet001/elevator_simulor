@@ -1,0 +1,617 @@
+import sys
+import random
+import time
+from collections import defaultdict
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QSpinBox, QPushButton, QGroupBox, QCheckBox, QGridLayout)
+from PyQt5.QtCore import Qt, QTimer, QRectF, QPoint
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont
+
+
+class Elevator:
+    def __init__(self, id, max_capacity, default_floor, floors):
+        self.id = id
+        self.max_capacity = max_capacity
+        self.current_floor = default_floor
+        self.destination_floors = []
+        self.direction = 0  # 0: idle, 1: up, -1: down
+        self.passengers = []
+        self.door_open = False
+        self.default_floor = default_floor
+        self.last_activity_time = time.time()
+        self.allowed_floors = floors
+        self.status = "空闲"
+        self.position = 0  # 新增：用于动画的当前位置
+        self.target_position = 0  # 新增：目标位置
+        
+    def add_destination(self, floor):
+        if floor not in self.destination_floors and floor in self.allowed_floors:
+            self.destination_floors.append(floor)
+            self.update_direction()
+            
+    def update_direction(self):
+        if not self.destination_floors:
+            self.direction = 0
+            return
+            
+        if self.current_floor < self.destination_floors[0]:
+            self.direction = 1
+        elif self.current_floor > self.destination_floors[0]:
+            self.direction = -1
+        else:
+            self.direction = 0
+            
+    def move(self):
+        if not self.door_open and self.destination_floors:
+            if self.current_floor < self.destination_floors[0]:
+                self.current_floor += 1
+                self.status = f"上行至{self.current_floor}F"
+            elif self.current_floor > self.destination_floors[0]:
+                self.current_floor -= 1
+                self.status = f"下行至{self.current_floor}F"
+                
+            if self.current_floor == self.destination_floors[0]:
+                self.open_door()
+                self.destination_floors.pop(0)
+                self.update_direction()
+                
+        # Check if elevator should return to default floor
+        if not self.destination_floors and not self.passengers:
+            idle_time = time.time() - self.last_activity_time
+            if idle_time > 3:  # 3 seconds
+                if self.current_floor != self.default_floor:
+                    self.add_destination(self.default_floor)
+                    
+    def open_door(self):
+        self.door_open = True
+        self.status = f"开门@{self.current_floor}F"
+        self.last_activity_time = time.time()
+        
+    def close_door(self):
+        self.door_open = False
+        self.status = "空闲" if not self.destination_floors else self.status
+        
+    def board_passenger(self, passenger):
+        if len(self.passengers) < self.max_capacity:
+            self.passengers.append(passenger)
+            self.add_destination(passenger.destination)
+            self.last_activity_time = time.time()
+            return True
+        return False
+    
+    def unboard_passengers(self):
+        unboarded = [p for p in self.passengers if p.destination == self.current_floor]
+        self.passengers = [p for p in self.passengers if p.destination != self.current_floor]
+        return unboarded
+
+
+class Passenger:
+    def __init__(self, current_floor, destination):
+        self.current_floor = current_floor
+        self.destination = destination
+        self.waiting_time = 0
+        self.in_elevator = False
+
+
+class SimulationDisplay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.simulator = parent
+        self.setStyleSheet("background-color: white;")
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Draw building
+        self.draw_building(painter)
+        
+        # Draw elevators
+        self.draw_elevators(painter)
+        
+        # Draw waiting passengers
+        self.draw_waiting_passengers(painter)
+        
+        painter.end()
+        
+    def draw_building(self, painter):
+        # Building dimensions
+        building_width = 800
+        building_height = 700
+        building_x = 50
+        building_y = 50
+        
+        # Draw building outline
+        painter.setPen(QPen(Qt.black, 2))
+        painter.drawRect(building_x, building_y, building_width, building_height)
+        
+        # Draw floors
+        floor_height = building_height / (self.simulator.total_floors + self.simulator.basement_floors + 2)
+        
+        for i, floor in enumerate(range(-self.simulator.basement_floors, self.simulator.total_floors + 1)):
+            if floor == 0:
+                continue
+                
+            y = building_y + building_height - (i + 1) * floor_height
+            
+            # Draw floor line
+            painter.setPen(QPen(Qt.gray, 1))
+            painter.drawLine(building_x, y, building_x + building_width, y)
+            
+            # Draw floor label
+            painter.setPen(Qt.black)
+            painter.drawText(building_x + 10, y + 20, f"{floor}F")
+            
+            # Draw elevator buttons
+            button_size = 20
+            button_x = building_x + building_width - 100
+            
+            # Up button
+            up_button_rect = QRectF(button_x, y + 10, button_size, button_size)
+            painter.setPen(QPen(Qt.black, 1))
+            
+            # Check if there are passengers waiting to go up
+            has_up_passengers = any(
+                p.destination > floor for p in self.simulator.waiting_passengers.get(floor, [])
+            )
+            
+            painter.setBrush(Qt.red if has_up_passengers else Qt.white)
+            painter.drawEllipse(up_button_rect)
+            painter.drawText(up_button_rect, Qt.AlignCenter, "↑")
+            
+            # Down button
+            down_button_rect = QRectF(button_x + button_size + 10, y + 10, button_size, button_size)
+            
+            # Check if there are passengers waiting to go down
+            has_down_passengers = any(
+                p.destination < floor for p in self.simulator.waiting_passengers.get(floor, [])
+            )
+            
+            painter.setBrush(Qt.red if has_down_passengers else Qt.white)
+            painter.drawEllipse(down_button_rect)
+            painter.drawText(down_button_rect, Qt.AlignCenter, "↓")
+        
+    def draw_elevators(self, painter):
+        if not self.simulator.elevators:
+            return
+            
+        building_width = 800
+        building_height = 700
+        building_x = 50
+        building_y = 50
+        floor_height = building_height / (self.simulator.total_floors + self.simulator.basement_floors + 2)
+        
+        # Calculate elevator dimensions and positions
+        elevator_width = 60
+        elevator_spacing = (building_width - 150) / len(self.simulator.elevators)
+        
+        for i, elevator in enumerate(self.simulator.elevators):
+            # Calculate elevator position with animation
+            floor_index = (self.simulator.basement_floors + elevator.current_floor) if elevator.current_floor > 0 else (self.simulator.basement_floors + abs(elevator.current_floor))
+            target_y = building_y + building_height - (floor_index + 1) * floor_height + 10
+            
+            # Update elevator's target position
+            elevator.target_position = target_y
+            
+            # Animate movement (1 pixel per frame)
+            if abs(elevator.position - target_y) > 1:
+                if elevator.position < target_y:
+                    elevator.position += 1
+                else:
+                    elevator.position -= 1
+            
+            elevator_x = building_x + 100 + i * elevator_spacing
+            elevator_y = elevator.position
+            
+            # Draw elevator
+            painter.setPen(QPen(Qt.black, 2))
+            painter.setBrush(Qt.lightGray)
+            painter.drawRect(elevator_x, elevator_y, elevator_width, floor_height - 20)
+            
+            # Draw door
+            door_width = 20
+            if elevator.door_open:
+                # Open door
+                painter.setBrush(Qt.white)
+                painter.drawRect(elevator_x, elevator_y, door_width/2, floor_height - 20)
+                painter.drawRect(elevator_x + elevator_width - door_width/2, elevator_y, door_width/2, floor_height - 20)
+            else:
+                # Closed door
+                painter.setBrush(Qt.darkGray)
+                painter.drawRect(elevator_x, elevator_y, door_width, floor_height - 20)
+                painter.drawRect(elevator_x + elevator_width - door_width, elevator_y, door_width, floor_height - 20)
+            
+            # Draw elevator info
+            painter.setPen(Qt.black)
+            font = QFont()
+            font.setPointSize(8)
+            painter.setFont(font)
+            
+            # Elevator ID
+            painter.drawText(elevator_x + 5, elevator_y + 15, f"电梯{elevator.id}")
+            
+            # Passenger count
+            painter.drawText(elevator_x + 5, elevator_y + 30, f"{len(elevator.passengers)}/{elevator.max_capacity}")
+            
+            # Direction indicator
+            if elevator.direction == 1:
+                painter.drawText(elevator_x + elevator_width - 15, elevator_y + 15, "↑")
+            elif elevator.direction == -1:
+                painter.drawText(elevator_x + elevator_width - 15, elevator_y + 15, "↓")
+            
+            # Draw passengers in elevator (as simple circles)
+            for j in range(len(elevator.passengers)):
+                px = elevator_x + 15 + (j % 3) * 10
+                py = elevator_y + 40 + (j // 3) * 15
+                painter.setBrush(Qt.blue)
+                painter.drawEllipse(px, py, 8, 8)
+        
+    def draw_waiting_passengers(self, painter):
+        building_width = 800
+        building_height = 700
+        building_x = 50
+        building_y = 50
+        floor_height = building_height / (self.simulator.total_floors + self.simulator.basement_floors + 2)
+        
+        for floor, passengers in self.simulator.waiting_passengers.items():
+            floor_index = (self.simulator.basement_floors + floor) if floor > 0 else (self.simulator.basement_floors + abs(floor))
+            floor_y = building_y + building_height - (floor_index + 1) * floor_height + 10
+            
+            # Draw waiting passengers (as simple circles)
+            for i, passenger in enumerate(passengers[:10]):  # Limit to 10 visible per floor
+                px = building_x + 30 + (i % 5) * 15
+                py = floor_y + (i // 5) * 15
+                painter.setBrush(Qt.green)
+                painter.drawEllipse(px, py, 8, 8)
+
+
+class ElevatorSimulator(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("楼宇电梯运行模拟系统")
+        self.setGeometry(100, 100, 1200, 800)
+        
+        # Simulation parameters
+        self.elevators = []
+        self.total_floors = 20
+        self.basement_floors = 0
+        self.passengers = []
+        self.waiting_passengers = defaultdict(list)
+        self.simulation_time = 0
+        self.time_multiplier = 60  # 1 real second = 1 simulation minute
+        self.is_running = False
+        self.peak_hours = {
+            "morning": (8, 9),    # 8-9 AM
+            "evening": (18, 21)   # 6-9 PM
+        }
+        
+        # UI Setup
+        self.init_ui()
+        
+        # Timers
+        self.simulation_timer = QTimer(self)
+        self.simulation_timer.timeout.connect(self.update_simulation)
+        self.animation_timer = QTimer(self)
+        self.animation_timer.timeout.connect(self.update_animation)
+        
+        # Start animation timer (60 FPS)
+        self.animation_timer.start(16)
+        
+    def init_ui(self):
+        # Main layout
+        main_widget = QWidget()
+        main_layout = QHBoxLayout()
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+        
+        # Control panel
+        control_panel = QGroupBox("电梯配置")
+        control_layout = QVBoxLayout()
+        control_panel.setLayout(control_layout)
+        control_panel.setFixedWidth(300)
+        
+        # Elevator count
+        elevator_count_layout = QHBoxLayout()
+        elevator_count_layout.addWidget(QLabel("电梯数量 (1-6):"))
+        self.elevator_count = QSpinBox()
+        self.elevator_count.setRange(1, 6)
+        self.elevator_count.setValue(3)
+        elevator_count_layout.addWidget(self.elevator_count)
+        control_layout.addLayout(elevator_count_layout)
+        
+        # Total floors
+        total_floors_layout = QHBoxLayout()
+        total_floors_layout.addWidget(QLabel("地上楼层 (1-20):"))
+        self.total_floors_input = QSpinBox()
+        self.total_floors_input.setRange(1, 20)
+        self.total_floors_input.setValue(20)
+        total_floors_layout.addWidget(self.total_floors_input)
+        control_layout.addLayout(total_floors_layout)
+        
+        # Basement floors
+        basement_floors_layout = QHBoxLayout()
+        basement_floors_layout.addWidget(QLabel("地下楼层 (0-2):"))
+        self.basement_floors_input = QSpinBox()
+        self.basement_floors_input.setRange(0, 2)
+        self.basement_floors_input.setValue(1)
+        basement_floors_layout.addWidget(self.basement_floors_input)
+        control_layout.addLayout(basement_floors_layout)
+        
+        # Default floor
+        default_floor_layout = QHBoxLayout()
+        default_floor_layout.addWidget(QLabel("默认停靠楼层:"))
+        self.default_floor_input = QSpinBox()
+        self.default_floor_input.setRange(-2, 20)
+        self.default_floor_input.setValue(1)
+        default_floor_layout.addWidget(self.default_floor_input)
+        control_layout.addLayout(default_floor_layout)
+        
+        # Elevator settings group
+        self.elevator_settings_group = QGroupBox("电梯详细设置")
+        self.elevator_settings_layout = QVBoxLayout()
+        self.elevator_settings_group.setLayout(self.elevator_settings_layout)
+        control_layout.addWidget(self.elevator_settings_group)
+        
+        # Create elevator settings based on count
+        self.create_elevator_settings()
+        self.elevator_count.valueChanged.connect(self.create_elevator_settings)
+        
+        # Simulation controls
+        start_button = QPushButton("开始模拟")
+        start_button.clicked.connect(self.start_simulation)
+        control_layout.addWidget(start_button)
+        
+        stop_button = QPushButton("停止模拟")
+        stop_button.clicked.connect(self.stop_simulation)
+        control_layout.addWidget(stop_button)
+        
+        # Stats display
+        self.stats_label = QLabel("模拟统计信息将显示在这里")
+        self.stats_label.setWordWrap(True)
+        control_layout.addWidget(self.stats_label)
+        
+        # Simulation display
+        self.simulation_display = SimulationDisplay(self)
+        
+        # Add to main layout
+        main_layout.addWidget(control_panel)
+        main_layout.addWidget(self.simulation_display)
+        
+    def create_elevator_settings(self):
+        # Clear existing settings
+        while self.elevator_settings_layout.count():
+            child = self.elevator_settings_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+                
+        # Create settings for each elevator
+        for i in range(self.elevator_count.value()):
+            group = QGroupBox(f"电梯 {i+1}")
+            layout = QVBoxLayout()
+            
+            # Capacity
+            cap_layout = QHBoxLayout()
+            cap_layout.addWidget(QLabel("限乘人数:"))
+            capacity = QSpinBox()
+            capacity.setRange(1, 20)
+            capacity.setValue(10)
+            capacity.setObjectName(f"capacity_{i}")
+            cap_layout.addWidget(capacity)
+            layout.addLayout(cap_layout)
+            
+            # Allowed floors
+            layout.addWidget(QLabel("可停靠楼层:"))
+            
+            # Create grid layout for floor checkboxes (5 columns)
+            floor_grid = QGridLayout()
+            
+            min_floor = -self.basement_floors_input.value()
+            max_floor = self.total_floors_input.value()
+            floors = [f for f in range(min_floor, max_floor + 1) if f != 0]
+            
+            row, col = 0, 0
+            for floor in floors:
+                cb = QCheckBox(f"{floor}F")
+                cb.setChecked(True)
+                cb.setObjectName(f"elevator_{i}_floor_{floor}")
+                floor_grid.addWidget(cb, row, col)
+                col += 1
+                if col >= 5:
+                    col = 0
+                    row += 1
+            
+            layout.addLayout(floor_grid)
+            group.setLayout(layout)
+            self.elevator_settings_layout.addWidget(group)
+        
+    def start_simulation(self):
+        if self.is_running:
+            return
+            
+        # Get simulation parameters
+        self.total_floors = self.total_floors_input.value()
+        self.basement_floors = self.basement_floors_input.value()
+        default_floor = self.default_floor_input.value()
+        
+        # Initialize elevators
+        self.elevators = []
+        for i in range(self.elevator_count.value()):
+            # Get capacity
+            capacity = self.findChild(QSpinBox, f"capacity_{i}").value()
+            
+            # Get allowed floors
+            allowed_floors = []
+            min_floor = -self.basement_floors
+            max_floor = self.total_floors
+            for floor in range(min_floor, max_floor + 1):
+                if floor == 0:
+                    continue
+                cb = self.findChild(QCheckBox, f"elevator_{i}_floor_{floor}")
+                if cb and cb.isChecked():
+                    allowed_floors.append(floor)
+            
+            # Create elevator
+            elevator = Elevator(i+1, capacity, default_floor, allowed_floors)
+            self.elevators.append(elevator)
+        
+        # Reset simulation state
+        self.passengers = []
+        self.waiting_passengers = defaultdict(list)
+        self.simulation_time = 0
+        self.is_running = True
+        
+        # Start simulation timer (updates every second)
+        self.simulation_timer.start(1000)
+        
+        # Assign initial destinations to get elevators moving
+        for elevator in self.elevators:
+            if not elevator.destination_floors:
+                # Assign a random floor to start moving
+                available_floors = [f for f in elevator.allowed_floors if f != elevator.current_floor]
+                if available_floors:
+                    elevator.add_destination(random.choice(available_floors))
+        
+    def stop_simulation(self):
+        self.is_running = False
+        self.simulation_timer.stop()
+        
+        # Clear all passengers and waiting lists
+        self.passengers = []
+        self.waiting_passengers = defaultdict(list)
+        
+        # Update stats to show cleared state
+        self.update_stats()
+        
+    def update_simulation(self):
+        if not self.is_running:
+            return
+            
+        # Advance simulation time
+        self.simulation_time += 1
+        
+        # Get current hour
+        current_hour = (self.simulation_time // 60) % 24
+        
+        # Check if we're in peak hours
+        is_morning_peak = self.peak_hours["morning"][0] <= current_hour < self.peak_hours["morning"][1]
+        is_evening_peak = self.peak_hours["evening"][0] <= current_hour < self.peak_hours["evening"][1]
+        is_peak = is_morning_peak or is_evening_peak
+        
+        # Generate new passengers
+        if random.random() < (0.8 if is_peak else 0.3):
+            # Determine how many passengers to generate
+            passenger_count = random.randint(1, 5 if is_peak else 2)
+            
+            # Determine floors based on peak times
+            if is_morning_peak:
+                # Morning peak: more people going up from basement/1F to higher floors
+                start_floors = random.choices(
+                    [-1, -2, 1] if self.basement_floors > 0 else [1],
+                    weights=[3, 2, 5] if self.basement_floors > 0 else [1],
+                    k=passenger_count
+                )
+                end_floors = random.choices(
+                    range(2, self.total_floors + 1),
+                    k=passenger_count
+                )
+            elif is_evening_peak:
+                # Evening peak: more people going down from higher floors to basement/1F
+                start_floors = random.choices(
+                    range(2, self.total_floors + 1),
+                    k=passenger_count
+                )
+                end_floors = random.choices(
+                    [-1, -2, 1] if self.basement_floors > 0 else [1],
+                    weights=[3, 2, 5] if self.basement_floors > 0 else [1],
+                    k=passenger_count
+                )
+            else:
+                # Normal hours: random distribution
+                all_floors = [f for f in range(-self.basement_floors, self.total_floors + 1) if f != 0]
+                start_floors = random.choices(all_floors, k=passenger_count)
+                end_floors = random.choices(all_floors, k=passenger_count)
+            
+            # Create passengers
+            for start, end in zip(start_floors, end_floors):
+                if start != end:  # Don't create passengers going to same floor
+                    passenger = Passenger(start, end)
+                    self.waiting_passengers[start].append(passenger)
+                    self.passengers.append(passenger)
+        
+        # Update waiting passengers
+        for floor, passengers in self.waiting_passengers.items():
+            for passenger in passengers:
+                passenger.waiting_time += 1
+        
+        # Move elevators
+        for elevator in self.elevators:
+            # Move elevator
+            elevator.move()
+            
+            # If door is open, try to unboard and board passengers
+            if elevator.door_open:
+                # Unboard passengers
+                unboarded = elevator.unboard_passengers()
+                
+                # Board passengers
+                floor_passengers = self.waiting_passengers.get(elevator.current_floor, [])
+                if floor_passengers:
+                    # Filter passengers going in the same direction
+                    if elevator.direction == 1:  # Going up
+                        to_board = [p for p in floor_passengers if p.destination > elevator.current_floor]
+                    elif elevator.direction == -1:  # Going down
+                        to_board = [p for p in floor_passengers if p.destination < elevator.current_floor]
+                    else:  # Idle
+                        to_board = floor_passengers[:elevator.max_capacity - len(elevator.passengers)]
+                    
+                    # Try to board each passenger
+                    for passenger in to_board[:]:
+                        if elevator.board_passenger(passenger):
+                            passenger.in_elevator = True
+                            floor_passengers.remove(passenger)
+                
+                # Close door after some time
+                if time.time() - elevator.last_activity_time > 10:  # 10 seconds for door open
+                    elevator.close_door()
+            
+            # If elevator is idle, assign a random destination
+            if not elevator.destination_floors and not elevator.door_open:
+                available_floors = [f for f in elevator.allowed_floors if f != elevator.current_floor]
+                if available_floors:
+                    elevator.add_destination(random.choice(available_floors))
+        
+        # Update stats
+        self.update_stats()
+        
+    def update_animation(self):
+        self.simulation_display.update()
+        
+    def update_stats(self):
+        total_passengers = len(self.passengers)
+        waiting_passengers = sum(len(p) for p in self.waiting_passengers.values())
+        in_elevator_passengers = total_passengers - waiting_passengers
+        
+        current_hour = (self.simulation_time // 60) % 24
+        current_minute = self.simulation_time % 60
+        
+        stats = (
+            f"模拟时间: {current_hour:02d}:{current_minute:02d}\n"
+            f"总人数: {total_passengers} (等待: {waiting_passengers}, 乘梯: {in_elevator_passengers})\n"
+            f"电梯状态:\n"
+        )
+        
+        for elevator in self.elevators:
+            stats += (
+                f"电梯{elevator.id}: {elevator.status}, "
+                f"人数: {len(elevator.passengers)}/{elevator.max_capacity}, "
+                f"当前楼层: {elevator.current_floor}F\n"
+            )
+        
+        self.stats_label.setText(stats)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    simulator = ElevatorSimulator()
+    simulator.show()
+    sys.exit(app.exec_())
